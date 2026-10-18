@@ -87,9 +87,9 @@ Windows 用户也可以直接双击 `run.bat`（会在 `.env` 里读配置，格
 本地配置也可以写在项目根目录的 `.env`：
 
 ```ini
-SMTP_USER=3282491159@qq.com
+SMTP_USER=1234567890@qq.com
 SMTP_PASS=abcdefghijklmnop
-MAIL_TO=3282491159@qq.com
+MAIL_TO=1234567890@qq.com
 ```
 
 ---
