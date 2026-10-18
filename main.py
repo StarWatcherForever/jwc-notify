@@ -33,12 +33,24 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from email.header import Header
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
 from email.utils import formataddr, formatdate, make_msgid
 from pathlib import Path
+
+# --------------------------------------------------------------------------
+# 时间
+# --------------------------------------------------------------------------
+# GitHub Actions / 云函数的服务器都是 UTC 时区，直接用 datetime.now() 会差 8 小时
+# （邮件里写着 12:25，实际是晚上 20:25）。这里固定用北京时间，不依赖宿主机时区。
+CST = timezone(timedelta(hours=8))
+
+
+def now_dt() -> datetime:
+    return datetime.now(CST)
+
 
 # --------------------------------------------------------------------------
 # 配置
@@ -119,7 +131,7 @@ class Config:
 # --------------------------------------------------------------------------
 
 def log(msg: str) -> None:
-    print(f"[{datetime.now():%Y-%m-%d %H:%M:%S}] {msg}", flush=True)
+    print(f"[{now_dt():%Y-%m-%d %H:%M:%S}] {msg}", flush=True)
 
 
 # --------------------------------------------------------------------------
@@ -274,7 +286,7 @@ def save_state(path: Path, state: dict) -> None:
 
 
 def prune(state: dict, retention_days: int) -> None:
-    cutoff = (datetime.now() - timedelta(days=retention_days)).strftime("%Y-%m-%d")
+    cutoff = (now_dt() - timedelta(days=retention_days)).strftime("%Y-%m-%d")
     seen = state.get("seen", {})
     for fp in [k for k, v in seen.items() if len(v) > 4 and v[4] < cutoff]:
         del seen[fp]
@@ -285,7 +297,7 @@ def prune(state: dict, retention_days: int) -> None:
 # --------------------------------------------------------------------------
 
 def build_mail(new_items: list[dict], total: int, columns: list[str]):
-    now = datetime.now()
+    now = now_dt()
     n = len(new_items)
     subject = f"【东南大学教务处】新增 {n} 条通知 · {now:%m-%d %H:%M}"
 
@@ -398,7 +410,7 @@ def main(argv=None) -> int:
             return 2
         subject, html, text = build_mail(
             [{"title": "这是一封测试邮件，看到它说明 SMTP 配置正确",
-              "url": cfg.base, "date": datetime.now().strftime("%Y-%m-%d"),
+              "url": cfg.base, "date": now_dt().strftime("%Y-%m-%d"),
               "column": "测试"}], 1, [c[0] for c in cfg.columns])
         send_mail(cfg, "【测试】" + subject, html, text)
         log(f"测试邮件已发送至 {cfg.mail_to}")
@@ -445,8 +457,8 @@ def main(argv=None) -> int:
     if args.init or first_run:
         for fp, it in unique.items():
             seen[fp] = [it["title"], it["url"], it.get("date", ""), it["column"],
-                        datetime.now().strftime("%Y-%m-%d")]
-        state["updated"] = datetime.now().isoformat(timespec="seconds")
+                        now_dt().strftime("%Y-%m-%d")]
+        state["updated"] = now_dt().isoformat(timespec="seconds")
         prune(state, cfg.retention_days)
         save_state(cfg.state_file, state)
         if args.init:
@@ -475,8 +487,8 @@ def main(argv=None) -> int:
     for it in new:
         fp = fingerprint(it["url"])
         seen[fp] = [it["title"], it["url"], it.get("date", ""), it["column"],
-                    datetime.now().strftime("%Y-%m-%d")]
-    state["updated"] = datetime.now().isoformat(timespec="seconds")
+                    now_dt().strftime("%Y-%m-%d")]
+    state["updated"] = now_dt().isoformat(timespec="seconds")
     prune(state, cfg.retention_days)
     save_state(cfg.state_file, state)
     log(f"已推送 {len(new)} 条新增通知并保存状态")
@@ -501,16 +513,19 @@ def _alert(cfg: Config, state: dict, subject: str) -> None:
     cd = timedelta(hours=cfg.alert_cooldown_h)
     if last:
         try:
-            if datetime.now() - datetime.fromisoformat(last) < cd:
+            prev = datetime.fromisoformat(last)
+            if prev.tzinfo is None:        # 兼容旧版本写下的、不带时区的记录
+                prev = prev.replace(tzinfo=CST)
+            if now_dt() - prev < cd:
                 log("告警冷却中，本次不重复发送")
                 return
-        except ValueError:
+        except (ValueError, TypeError):
             pass
     try:
         send_mail(cfg, f"【告警】{subject}",
                   f"<p style='font-family:sans-serif'>{html_escape(subject)}</p>",
                   subject)
-        state["last_alert"] = datetime.now().isoformat(timespec="seconds")
+        state["last_alert"] = now_dt().isoformat(timespec="seconds")
         save_state(cfg.state_file, state)
         log("已发送告警邮件")
     except Exception as exc:                           # noqa: BLE001
