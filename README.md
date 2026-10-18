@@ -73,9 +73,9 @@ rem 2) 建基线：把当前通知全部记为已见，不发信
 python main.py --init
 
 rem 3) 单独测邮件配置对不对
-set SMTP_USER=3282491159@qq.com
+set SMTP_USER=1234567890@qq.com
 set SMTP_PASS=你的授权码
-set MAIL_TO=3282491159@qq.com
+set MAIL_TO=1234567890@qq.com
 python main.py --test-mail
 
 rem 4) 把邮件渲染成 HTML 看一眼长什么样
