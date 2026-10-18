@@ -1,0 +1,60 @@
+name: 教务处通知推送
+
+# 每 15 分钟检查一次东南大学教务处 7 个栏目，有新通知就发邮件。
+# 注意：私有仓库改成 "*/30"（15 分钟会让私有仓库 2000 分钟/月的免费额度超支）。
+
+on:
+  schedule:
+    - cron: "*/15 * * * *"
+  workflow_dispatch:        # 支持手动点按钮运行
+
+permissions:
+  contents: write           # 需要把状态文件提交回仓库
+
+concurrency:
+  group: jwc-notify
+  cancel-in-progress: false
+
+jobs:
+  notify:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - name: 拉取代码
+        uses: actions/checkout@v4
+
+      - name: 准备 Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: 抓取并推送
+        env:
+          SMTP_HOST: smtp.qq.com
+          SMTP_PORT: "465"
+          SMTP_USER: ${{ secrets.SMTP_USER }}
+          SMTP_PASS: ${{ secrets.SMTP_PASS }}
+          MAIL_TO: ${{ secrets.MAIL_TO }}
+          # 想少推几个栏目就改这里，删掉对应的一项即可
+          # JW_COLUMNS: "教务信息=/jwxx/list.htm,学籍管理=/xjgl/list.htm"
+        run: python main.py
+
+      - name: 保存抓取状态
+        if: always()
+        run: |
+          set -e
+          if [ ! -f .state/state.json ]; then
+            echo "没有状态文件，跳过"
+            exit 0
+          fi
+          git config user.name  "jwc-notify-bot"
+          git config user.email "jwc-notify-bot@users.noreply.github.com"
+          git add .state/state.json
+          if git diff --cached --quiet; then
+            echo "状态没有变化，不产生提交"
+            exit 0
+          fi
+          git commit -m "chore(state): 更新已推送记录 [skip ci]"
+          git pull --rebase --autostash origin "${GITHUB_REF_NAME}" || true
+          git push
