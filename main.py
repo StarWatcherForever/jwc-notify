@@ -59,16 +59,22 @@ def now_dt() -> datetime:
 UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
       "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36")
 
-# 栏目名 = 列表页路径。顺序即邮件里的展示顺序。
-# 注意：/whszjy/list.htm 是废弃空页，真正的「文化素质教育」在 /cbxx/list.htm
+# 栏目名 = 列表页路径。顺序即优先级：同一条通知出现在多个栏目时，靠前的栏目名优先。
+# 2026-10 教务处改版：老地址 /xxx/list.htm 逐步换成 /xxx/list.psp，栏目也重排了。
+# 最后一项「通知公告」是全站聚合页（栏目 ID 71422），它会把各栏目的文章再转一遍，
+# 所以必须排最后 —— 这样去重时保留前面更精确的栏目名，它只用来兜住「只在聚合页出现」的通知。
 DEFAULT_COLUMNS = [
-    ("最新动态",     "/xxtz/list.htm"),
-    ("教务信息",     "/jwxx/list.htm"),
-    ("学籍管理",     "/xjgl/list.htm"),
-    ("教学研究",     "/jxyj/list.htm"),
-    ("实践教学",     "/sjjx/list.htm"),
-    ("国际交流",     "/gjjl/list.htm"),
-    ("文化素质教育", "/cbxx/list.htm"),
+    ("教务信息",     "/jwxx/list.psp"),
+    ("学籍管理",     "/xjgl/list.psp"),
+    ("教学研究",     "/jxyj/list.psp"),
+    ("SRTP/竞赛",    "/jsxm/list.psp"),
+    ("实习/毕设",    "/sxbs/list.psp"),
+    ("国际交流",     "/gjjl/list.psp"),
+    ("教师教学发展", "/jfzx/list.psp"),
+    ("文化素质教育", "/cbxx/list.psp"),
+    ("课外研学讲座", "/kwyxjz/list.psp"),
+    ("学业辅导讲座", "/xyfdjz/list.psp"),
+    ("通知公告",     "/jsgl2/list.htm"),
 ]
 
 
@@ -257,8 +263,23 @@ def parse_list(html: str, base_url: str, column: str) -> list[dict]:
     return items
 
 
+ART_ID_RE = re.compile(r"/c\d+a(\d+)/")
+
+
 def fingerprint(url: str) -> str:
-    """URL 指纹：统一协议/大小写、去掉 query 与锚点，避免同一条通知算出两个身份。"""
+    """
+    通知指纹。
+
+    改版后同一条通知会有两套 URL —— 栏目页一份、通知公告聚合页一份：
+        /2026/1013/c21679a585911/page.htm   ← 学籍管理栏目
+        /2026/1013/c71422a585911/page.htm   ← 通知公告聚合页
+    只有栏目 ID（c 后面）不同，文章 ID（a 后面）是同一个。
+    所以指纹只取文章 ID，否则同一条通知会被算成两条、推两次。
+    万一 URL 里没有文章 ID，退回用整条 URL 的哈希。
+    """
+    m = ART_ID_RE.search(url)
+    if m:
+        return "a" + m.group(1)
     p = urllib.parse.urlsplit(url)
     key = "https://" + p.netloc.lower() + (p.path or "/")
     return hashlib.sha1(key.encode("utf-8")).hexdigest()[:16]
@@ -283,6 +304,26 @@ def save_state(path: Path, state: dict) -> None:
     tmp = path.with_suffix(path.suffix + ".tmp")
     tmp.write_text(json.dumps(state, ensure_ascii=False, indent=1), "utf-8")
     tmp.replace(path)
+
+
+def migrate_state(state: dict) -> int:
+    """
+    指纹算法换过（从「整条 URL 哈希」改成「文章 ID」），老状态里的 key 全对不上。
+    如果不迁移，升级后第一轮会把库里的通知全当成新的，一次轰出上百条邮件。
+    这里按状态里存着的原始 URL 重新算一遍指纹，静默完成升级。
+    """
+    seen = state.get("seen") or {}
+    migrated, changed = {}, 0
+    for fp, val in seen.items():
+        try:
+            new_fp = fingerprint(val[1])
+        except Exception:                              # noqa: BLE001
+            new_fp = fp
+        if new_fp != fp:
+            changed += 1
+        migrated[new_fp] = val
+    state["seen"] = migrated
+    return changed
 
 
 def prune(state: dict, retention_days: int) -> None:
@@ -378,7 +419,11 @@ def crawl(cfg: Config) -> tuple[list[dict], list[str]]:
         base_url = f"{cfg.base}{path}"
         got = 0
         for page in range(1, max(1, cfg.max_pages) + 1):
-            url = base_url if page == 1 else re.sub(r"list\.htm$", f"list{page}.htm", base_url)
+            if page == 1:
+                url = base_url
+            else:
+                # /jwxx/list.psp -> /jwxx/list2.psp；/jsgl/list.htm -> /jsgl/list2.htm
+                url = re.sub(r"list\.(htm|psp)$", rf"list{page}.\1", base_url)
             try:
                 html = http_get(url, cfg.timeout, cfg.retries)
                 items = parse_list(html, cfg.base, name)
@@ -418,6 +463,10 @@ def main(argv=None) -> int:
 
     state = load_state(cfg.state_file)
     seen = state.setdefault("seen", {})
+    migrated = migrate_state(state) if seen else 0
+    seen = state["seen"]           # 迁移会换成新字典，局部变量必须重新绑定
+    if migrated:
+        log(f"状态指纹已按新规则迁移 {migrated} 条（升级兼容，不会重复推送）")
     first_run = not seen
 
     log(f"开始扫描 {len(cfg.columns)} 个栏目，每栏目 {cfg.max_pages} 页")
@@ -471,7 +520,12 @@ def main(argv=None) -> int:
         return 0
 
     if not new:
-        log("没有新增通知，本轮不发信")
+        if migrated:
+            state["updated"] = now_dt().isoformat(timespec="seconds")
+            save_state(cfg.state_file, state)
+            log("没有新增通知，本轮不发信（已保存迁移后的状态）")
+        else:
+            log("没有新增通知，本轮不发信")
         return 0
 
     subject, html, text = build_mail(new, len(unique), [c[0] for c in cfg.columns])
