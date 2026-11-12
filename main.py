@@ -101,8 +101,11 @@ class Config:
         self.max_pages = int(env("JW_MAX_PAGES", "1"))
         self.retention_days = int(env("JW_RETENTION_DAYS", "400"))
         self.alert_cooldown_h = int(env("JW_ALERT_COOLDOWN_HOURS", "12"))
-        self.timeout = int(env("JW_TIMEOUT", "25"))
-        self.retries = int(env("JW_RETRIES", "3"))
+        self.timeout = int(env("JW_TIMEOUT", "12"))
+        self.retries = int(env("JW_RETRIES", "2"))
+        # 整轮抓取的总时间预算。站点不可达时靠它快速收工：
+        # 之前的配置最坏情况是 11 栏目 × 3 次 × 25 秒 ≈ 15 分钟，会撞上 Actions 的任务超时。
+        self.deadline = int(env("JW_DEADLINE", "300"))
 
         self.smtp_host = env("SMTP_HOST", "smtp.qq.com")
         self.smtp_port = int(env("SMTP_PORT", "465"))
@@ -413,9 +416,21 @@ def send_mail(cfg: Config, subject: str, html: str, text: str) -> None:
 # 主流程
 # --------------------------------------------------------------------------
 
-def crawl(cfg: Config) -> tuple[list[dict], list[str]]:
-    all_items, errors = [], []
+def crawl(cfg: Config) -> tuple[list[dict], list[str], int]:
+    """
+    返回 (所有条目, 错误列表, 成功抓到的页面数)。
+    第三个值用来区分两种「0 条」：
+      ok == 0  -> 网站根本连不上（网络 / WAF 抖动）
+      ok  > 0  -> 请求正常但一条都解析不出来（页面改版）
+    超时不再硬扛：一旦超过 cfg.deadline，剩下的栏目直接跳过。
+    """
+    all_items, errors, ok = [], [], 0
+    deadline = time.monotonic() + max(30, cfg.deadline)
     for name, path in cfg.columns:
+        if time.monotonic() > deadline:
+            errors.append(f"{name}: 跳过（已用满 {cfg.deadline}s 总预算）")
+            log(f"  {name:<8} 跳过（时间预算已用尽）")
+            continue
         base_url = f"{cfg.base}{path}"
         got = 0
         for page in range(1, max(1, cfg.max_pages) + 1):
@@ -426,6 +441,7 @@ def crawl(cfg: Config) -> tuple[list[dict], list[str]]:
                 url = re.sub(r"list\.(htm|psp)$", rf"list{page}.\1", base_url)
             try:
                 html = http_get(url, cfg.timeout, cfg.retries)
+                ok += 1
                 items = parse_list(html, cfg.base, name)
                 all_items.extend(items)
                 got += len(items)
@@ -433,7 +449,7 @@ def crawl(cfg: Config) -> tuple[list[dict], list[str]]:
                 errors.append(f"{name} 第{page}页: {exc}")
                 break
         log(f"  {name:<8} {got:>3} 条")
-    return all_items, errors
+    return all_items, errors, ok
 
 
 def main(argv=None) -> int:
@@ -470,13 +486,23 @@ def main(argv=None) -> int:
     first_run = not seen
 
     log(f"开始扫描 {len(cfg.columns)} 个栏目，每栏目 {cfg.max_pages} 页")
-    items, errors = crawl(cfg)
+    t0 = time.monotonic()
+    items, errors, ok = crawl(cfg)
     for e in errors:
         log(f"  ! {e}")
-    log(f"共解析 {len(items)} 条，去重后 {len({fingerprint(i['url']) for i in items})} 个不同链接")
+    log(f"共解析 {len(items)} 条，去重后 {len({fingerprint(i['url']) for i in items})} 个不同链接，"
+        f"耗时 {time.monotonic() - t0:.0f}s")
 
     if not items:
-        log("解析结果为 0 条 —— 大概率是页面改版导致选择器失效，需要立即排查")
+        if ok == 0:
+            # 网站一个页面都没抓下来：网络 / WAF 抖动，不是我们能修的。
+            # 不把自己判失败（否则每次抖动 GitHub 都发一封 "Run failed"），
+            # 但带 12 小时冷却地提醒一次，避免长期瘫痪没人知道。
+            log(f"{len(cfg.columns)} 个栏目全部抓取失败 —— 站点不可达，本轮跳过，下轮自动重试")
+            if not args.dry_run and cfg.mail_ready():
+                _alert(cfg, state, "教务处网站抓取全部失败（网络或站点不可用），通知可能延迟")
+            return 0
+        log("解析结果为 0 条 —— 请求正常但页面结构变了，大概率是改版，需要立即排查")
         if not args.dry_run and cfg.mail_ready():
             _alert(cfg, state, "教务处通知解析为 0 条，可能页面改版了，请检查 jwc-notify")
         return 1
